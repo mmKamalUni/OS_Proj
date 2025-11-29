@@ -1,3 +1,10 @@
+// OS Project: Neural Network Simulation using Processes and Threads
+// Process Mapping: Each layer (input, hidden, output) runs in its own process (fork).
+// Thread Mapping: Within each process, each neuron is computed by a separate thread (pthread).
+// IPC: Adjacent processes communicate via unnamed pipes (forward for outputs, backward for fx1/fx2).
+// Synchronization: Threads in a process use a shared mutex to write to output array.
+// No actual backpropagation; backward pass just propagates fx1/fx2 from output layer.
+
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -66,6 +73,8 @@ void* compute_neuron(void* arg) {
 }
 
 double* compute_layer_outputs(int curr_neurons, int prev_neurons, const double* inputs, double** weights) {
+    // Thread Mapping: One thread per neuron to compute weighted sum concurrently.
+    // Synchronization: Mutex protects writes to shared outputs array.
     pthread_mutex_t mutex;
     pthread_mutex_init(&mutex, nullptr);
     vector<pthread_t> threads(curr_neurons);
@@ -87,6 +96,7 @@ double* compute_layer_outputs(int curr_neurons, int prev_neurons, const double* 
 }
 
 void write_to_pipe(int fd, const double* data, int size) {
+    // IPC: Robust write to pipe, handling partial writes and EINTR.
     const char* buf = reinterpret_cast<const char*>(data);
     size_t to_write = sizeof(double) * size;
     size_t written = 0;
@@ -102,6 +112,7 @@ void write_to_pipe(int fd, const double* data, int size) {
 }
 
 void read_from_pipe(int fd, double* data, int size) {
+    // IPC: Robust read from pipe, handling partial reads, EOF, and EINTR.
     char* buf = reinterpret_cast<char*>(data);
     size_t to_read = sizeof(double) * size;
     size_t got = 0;
@@ -125,36 +136,57 @@ void read_from_pipe(int fd, double* data, int size) {
     }
 }
 
-void process_layer(int layer_index, int prev_neurons, int curr_neurons, bool is_output, double* all_data, int read_fd, int write_fd, int read_back_fd, int write_back_fd, int offset_start) {
+void process_layer(int layer_index, int prev_neurons, int curr_neurons, bool is_output, double* all_data, int read_fd, int write_fd, int read_back_fd, int write_back_fd, int offset_start, bool use_input_weights) {
     double back[2];
     ofstream outfile("output.txt", ios::app);
-    // Special-case input layer: pass-through of first two inputs
+    // Special-case input layer: use threads with weights or identity for pass-through
     if (layer_index == 0) {
-        double* outputs = new double[2];
-        outputs[0] = all_data[0];
-        outputs[1] = all_data[1];
+        double* inputs = new double[2];
+        inputs[0] = all_data[0];
+        inputs[1] = all_data[1];
+        double** weights;
+        if (use_input_weights) {
+            int off = offset_start;
+            weights = get_weights(2, 2, all_data, off);
+        } else {
+            // Dummy identity weights for pass-through
+            weights = new double*[2];
+            weights[0] = new double[2]{1.0, 0.0};
+            weights[1] = new double[2]{0.0, 1.0};
+        }
+        double* outputs = compute_layer_outputs(2, 2, inputs, weights);
         cout << "Layer " << layer_index << " Forward Pass 1 outputs: " << outputs[0] << " " << outputs[1] << endl;
-        outfile << outputs[0] << " " << outputs[1] << endl;
+        outfile << "Layer " << layer_index << " Forward Pass 1 outputs: " << outputs[0] << " " << outputs[1] << endl;
         if (!is_output && write_fd != -1) write_to_pipe(write_fd, outputs, 2);
 
         // wait for backward values
         if (read_back_fd != -1) {
             read_from_pipe(read_back_fd, back, 2);
             cout << "Layer " << layer_index << " Backward: " << back[0] << " " << back[1] << endl;
-            outfile << back[0] << " " << back[1] << endl;
+            outfile << "Layer " << layer_index << " Backward: " << back[0] << " " << back[1] << endl;
             if (layer_index > 0 && write_back_fd != -1) write_to_pipe(write_back_fd, back, 2);
         }
 
-        // Second forward pass uses back values as inputs
-        double* outputs2 = new double[2];
-        outputs2[0] = back[0];
-        outputs2[1] = back[1];
+        // Second forward pass uses back values as inputs, reuse weights
+        double* inputs2 = new double[2];
+        inputs2[0] = back[0];
+        inputs2[1] = back[1];
+        double* outputs2 = compute_layer_outputs(2, 2, inputs2, weights);
         cout << "Layer " << layer_index << " Forward Pass 2 outputs: " << outputs2[0] << " " << outputs2[1] << endl;
-        outfile << outputs2[0] << " " << outputs2[1] << endl;
+        outfile << "Layer " << layer_index << " Forward Pass 2 outputs: " << outputs2[0] << " " << outputs2[1] << endl;
         if (!is_output && write_fd != -1) write_to_pipe(write_fd, outputs2, 2);
 
+        delete[] inputs;
+        delete[] inputs2;
         delete[] outputs;
         delete[] outputs2;
+        if (use_input_weights) {
+            for (int j = 0; j < 2; ++j) delete[] weights[j];
+        } else {
+            delete[] weights[0];
+            delete[] weights[1];
+        }
+        delete[] weights;
         // close fds
         if (write_fd != -1) close(write_fd);
         if (read_back_fd != -1) close(read_back_fd);
@@ -173,7 +205,8 @@ void process_layer(int layer_index, int prev_neurons, int curr_neurons, bool is_
     cout << "Layer " << layer_index << " Forward Pass 1 outputs:";
     for (int i = 0; i < curr_neurons; ++i) cout << " " << outputs[i];
     cout << endl;
-    for (int i = 0; i < curr_neurons; ++i) outfile << outputs[i] << " ";
+    outfile << "Layer " << layer_index << " Forward Pass 1 outputs:";
+    for (int i = 0; i < curr_neurons; ++i) outfile << " " << outputs[i];
     outfile << endl;
     if (!is_output) {
         if (write_fd != -1) write_to_pipe(write_fd, outputs, curr_neurons);
@@ -183,7 +216,7 @@ void process_layer(int layer_index, int prev_neurons, int curr_neurons, bool is_
         double fx1 = (sum * sum + sum + 1) / 2;
         double fx2 = (sum * sum - sum) / 2;
         cout << "fx1: " << fx1 << ", fx2: " << fx2 << endl;
-        outfile << fx1 << " " << fx2 << endl;
+        outfile << "f(x1) and f(x2): " << fx1 << " " << fx2 << endl;
         back[0] = fx1; back[1] = fx2;
         if (write_back_fd != -1) write_to_pipe(write_back_fd, back, 2);
     }
@@ -195,7 +228,7 @@ void process_layer(int layer_index, int prev_neurons, int curr_neurons, bool is_
         // the second forward pass to avoid blocking on a second read.
         if (read_back_fd != -1) read_from_pipe(read_back_fd, back, 2);
         cout << "Layer " << layer_index << " Backward: " << back[0] << " " << back[1] << endl;
-        outfile << back[0] << " " << back[1] << endl;
+        outfile << "Layer " << layer_index << " Backward: " << back[0] << " " << back[1] << endl;
         if (layer_index > 0 && write_back_fd != -1) write_to_pipe(write_back_fd, back, 2);
     }
 
@@ -212,7 +245,8 @@ void process_layer(int layer_index, int prev_neurons, int curr_neurons, bool is_
     cout << "Layer " << layer_index << " Forward Pass 2 outputs:";
     for (int i = 0; i < curr_neurons; ++i) cout << " " << outputs2[i];
     cout << endl;
-    for (int i = 0; i < curr_neurons; ++i) outfile << outputs2[i] << " ";
+    outfile << "Layer " << layer_index << " Forward Pass 2 outputs:";
+    for (int i = 0; i < curr_neurons; ++i) outfile << " " << outputs2[i];
     outfile << endl;
     if (!is_output) {
         if (write_fd != -1) write_to_pipe(write_fd, outputs2, curr_neurons);
@@ -220,7 +254,7 @@ void process_layer(int layer_index, int prev_neurons, int curr_neurons, bool is_
         double sum2 = 0;
         for (int i = 0; i < curr_neurons; ++i) sum2 += outputs2[i];
         cout << "Second forward sum: " << sum2 << endl;
-        outfile << "Second forward sum: " << sum2 << endl;
+        outfile << "Second Forward Sum: " << sum2 << endl;
     }
 
     delete[] inputs2;
@@ -244,6 +278,12 @@ int main() {
     cout << "Enter number of neurons per hidden/output layer: ";
     cin >> num_neurons;
 
+    // Flag to optionally use weights for input layer
+    bool use_input_weights = false; // Set to true to load 2x2 weights for input layer
+
+    // Clear output.txt at start
+    { ofstream clearfile("output.txt"); } // Truncate the file
+
     // Input layer has fixed 2 neurons
 
     int data_size;
@@ -261,12 +301,19 @@ int main() {
     for (int li = 0; li < total_layers; ++li) {
         offset_for_layer[li] = offset;
         int curr_neurons = (li == 0 ? 2 : num_neurons);
-        int prev_neurons = (li == 0 ? 0 : (li == 1 ? 2 : num_neurons));
-        int count = (li == 0 ? 0 : prev_neurons * curr_neurons);
+        int prev_neurons = (li == 0 ? 2 : (li == 1 ? 2 : num_neurons)); // For layer 0, prev_neurons is 2 for weights
+        int count = (li == 0 ? (use_input_weights ? 2 * 2 : 0) : prev_neurons * curr_neurons);
         offset += count;
     }
 
+    // Validate sufficient data
+    if (data_size < offset) {
+        cerr << "Insufficient data in input.txt. Required at least " << offset << " values, but found " << data_size << "." << endl;
+        return 1;
+    }
+
     // Create pipes between adjacent layers
+    // IPC: Two pipes per adjacent pair (forward: outputs from prev to next; backward: fx1/fx2 from next to prev)
     int n_pipes = max(0, total_layers - 1);
     vector<array<int,2>> forward_pipes(n_pipes);
     vector<array<int,2>> backward_pipes(n_pipes);
@@ -275,6 +322,7 @@ int main() {
         if (pipe(backward_pipes[k].data()) == -1) { perror("pipe"); return 1; }
     }
 
+    // Process Mapping: Fork one process per layer (input, hidden1..h, output)
     vector<pid_t> children;
     for (int li = 0; li < total_layers; ++li) {
         pid_t pid = fork();
@@ -295,7 +343,7 @@ int main() {
             int curr_neurons = (li == 0 ? 2 : num_neurons);
             int prev_neurons = (li == 0 ? 0 : (li == 1 ? 2 : num_neurons));
             bool is_output = (li == total_layers - 1);
-            process_layer(li, prev_neurons, curr_neurons, is_output, all_data, read_fd, write_fd, read_back_fd, write_back_fd, offset_for_layer[li]);
+            process_layer(li, prev_neurons, curr_neurons, is_output, all_data, read_fd, write_fd, read_back_fd, write_back_fd, offset_for_layer[li], use_input_weights);
             // child done
             delete[] all_data;
             exit(0);
